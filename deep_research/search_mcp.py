@@ -1,18 +1,19 @@
 from mcp.server.fastmcp import FastMCP
-import pymysql
 import requests
 from openai import OpenAI
 mcp = FastMCP("search")
-import pymysql
 import pandas as pd
 from prompts import *
 import logging
+import config
 
 
+base_url = config.base_url
+api_key = config.api_key
+model_name = config.model_name
 
-base_url = "https://openrouter.ai/api/v1"
-api_key = 'aaa'
-model_name = 'deepseek/deepseek-chat:free'
+vl_base_url = config.vl_base_url
+vl_model_name = config.vl_model_name
 
 # 创建日志记录器
 logger = logging.getLogger(__name__)
@@ -34,6 +35,11 @@ logger.addHandler(file_handler)
 
 client = OpenAI(
             base_url=base_url,
+            api_key=api_key,
+        )
+
+vl_client = OpenAI(
+            base_url=vl_base_url,
             api_key=api_key,
         )
 
@@ -127,15 +133,39 @@ def get_new_search_queries(user_query, previous_search_queries, all_contexts):
 
 
 # Reorganized this function, integrated get_images calls, and set top_k as a parameter
-def web_search(query: str, top_k: int = 2, categories: str = 'general') -> str:
+def web_search(query: str, top_k: int = 2, categories: str = 'general') -> list:
     
-    links = []
-    response = requests.get(f'http://10.250.2.24:8088/search?format=json&q={query}&language=zh-CN&time_range=&safesearch=0&categories={categories}', timeout=10)
-    results = response.json()['results']
-    for result in results[:top_k]:
-        links.append(result['url' if categories == 'general' else 'img_src' if categories == 'images' else ''])
-    
-    return links
+    try:
+        logger.info(f"Searching for '{query}' with categories='{categories}', top_k={top_k}")
+        response = requests.get(f'{config.search_base_url}/search?format=json&q={query}&language=zh-CN&time_range=&safesearch=0&categories={categories}', timeout=10)
+        
+        if response.status_code != 200:
+            logger.error(f"Search API returned status code {response.status_code}")
+            return []
+            
+        results = response.json()['results']
+        links = []
+        
+        for result in results[:top_k]:
+            if categories == 'general':
+                links.append(result.get('url', ''))
+            elif categories == 'images':
+                links.append(result.get('img_src', ''))
+            else:
+                links.append(result.get('url', ''))
+        
+        logger.info(f"Found {len(links)} links for query '{query}'")
+        return links
+        
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout while searching for '{query}'")
+        return []
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error while searching for '{query}': {e}")
+        return []
+    except Exception as e:
+        logger.error(f"Unexpected error while searching for '{query}': {e}")
+        return []
     
 
 def fetch_webpage_text(url):
@@ -171,33 +201,40 @@ def process_link(link, query, search_query):
 
 
 def get_images_description(iamge_url):
-    completion = client.chat.completions.create(
-    
-    model="qwen/qwen2.5-vl-32b-instruct:free",
-    messages=[
-        {
-        "role": "user",
-        "content": [
-            {
-            "type": "text",
-            "text": "使用一句话描述图片的内容"
-            },
-            {
-            "type": "image_url",
-            "image_url": {
-                "url": iamge_url
-            }
-            }
-        ]
-        }
-    ]
-    )
-    return completion.choices[0].message.content
+    try:
+        logger.info(f"Getting description for image: {iamge_url}")
+        completion = vl_client.chat.completions.create(
+            model=vl_model_name,
+            messages=[
+                {
+                "role": "user",
+                "content": [
+                    {
+                    "type": "text",
+                    "text": "使用一句话描述图片的内容"
+                    },
+                    {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": iamge_url
+                    }
+                    }
+                ]
+                }
+            ],
+            timeout=30  # 添加30秒超时
+        )
+        description = completion.choices[0].message.content
+        logger.info(f"Successfully got description: {description}")
+        return description
+    except Exception as e:
+        logger.error(f"Error getting image description for {iamge_url}: {e}")
+        return f"无法获取图片描述: {str(e)}"
 
 @mcp.tool()
 def search(query: str) -> str:
     """互联网搜索"""
-    iteration_limit = 3
+    iteration_limit = config.iteration_limit
     iteration = 0
     aggregated_contexts = []  
     all_search_queries = []   
@@ -253,21 +290,37 @@ def search(query: str) -> str:
     return '\n\n'.join(aggregated_contexts)
 
 @mcp.tool()
-def get_images(query: str) -> str:
+def get_images(query: str) -> dict:
     '''获取图片链接和描述'''
     logger.info(f"Searching for images for query: {query}")
-    # Get image links directly through web_search function
-    img_srcs = web_search(query, top_k=2, categories='images')
-
-    result = {}
     
-    for img_src in img_srcs:
-        logger.info(f"Fetching image description for: {img_src}")
-        description = get_images_description(img_src)
-        logger.info(f"Image description for {img_src}: {description}")
-        result[img_src] = description
+    try:
+        # Get image links directly through web_search function
+        img_srcs = web_search(query, top_k=2, categories='images')
+        logger.info(f"Found {len(img_srcs)} image sources: {img_srcs}")
         
-    return result
+        if not img_srcs:
+            logger.warning("No images found for the query")
+            return {}
+        
+        result = {}
+        
+        for i, img_src in enumerate(img_srcs):
+            try:
+                logger.info(f"Processing image {i+1}/{len(img_srcs)}: {img_src}")
+                description = get_images_description(img_src)
+                logger.info(f"Image description for {img_src}: {description}")
+                result[img_src] = description
+            except Exception as e:
+                logger.error(f"Error processing image {img_src}: {e}")
+                result[img_src] = f"Error: {str(e)}"
+        
+        logger.info(f"Successfully processed {len(result)} images")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error in get_images function: {e}")
+        return {"error": f"Failed to get images: {str(e)}"}
     
   
 

@@ -10,9 +10,12 @@ from prompts import *
 from search_mcp import logger
 
 
-base_url = "https://openrouter.ai/api/v1"
-api_key = 'aaa'
-model_name = 'deepseek/deepseek-chat:free'
+import config
+
+
+base_url = config.base_url
+api_key = config.api_key
+model_name = config.model_name
 def get_clear_json(text):
     if '```json' not in text:
         return 0, text
@@ -129,8 +132,7 @@ class MCPClient:
                 "content": message.content
             })
         
-        
-        
+
         
         messages.append({
                 "role": "user",
